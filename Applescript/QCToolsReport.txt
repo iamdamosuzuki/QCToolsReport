@@ -1,0 +1,337 @@
+(*
+
+QCTools Report Generator
+
+Developed by Morgan Oscar Morel for George Blood Audio/Video/Film
+
+Version 0.5 - 20160111
+
+This script can be run on a directory or a file.
+	if run on a file the script will run on that file alone
+	if run on a folder, the script will prompt for a list of extensions, and run on files with those extensions
+
+DEPENDENCIES:
+	ffmpeg must be installed at /usr/local/bin/ffmpeg
+	ffprobe must be installed at /usr/local/bin/ffprobe
+	
+*)
+
+global theLog
+global theLogPosix
+
+on run
+	--Handler for when script is run as an application
+	set inputFolder to choose folder
+	my main(inputFolder)
+	
+end run
+
+
+on open dropped_item
+	--Handler for when script is run as a droplet	
+	set inputFolder to dropped_item as alias
+	my main(inputFolder)
+	
+end open
+
+
+----------------MAIN FUNCTION-----------------
+
+on main(theInput)
+	
+	--test for ffmpeg in desired location
+	try
+		do shell script "ls /usr/local/bin/ffmpeg"
+	on error
+		display dialog "This script will run ffmpeg from '/usr/local/bin/ffmpeg'. If your ffmpeg is installed in a different location then please symlink it to this path before running this script" with title "ERROR" with icon 0
+		return
+	end try
+	
+	--test for ffprobe in desired location	
+	try
+		do shell script "ls /usr/local/bin/ffprobe"
+	on error
+		display dialog "This script will run ffprobe from '/usr/local/bin/ffprobe'. If your ffmprobe is installed in a different location then please symlink it to this path before running this script" with title "ERROR" with icon 0
+		return
+	end try
+	
+	--Create the File List. If a single file is selected, a list is still returned, but only contains a single file
+	set fileList to my getFileList(theInput)
+	
+	--Get the length of the File List and report it in the log
+	set fileListLength to length of fileList
+	my newLineLog("Processing a total of " & fileListLength & " video files")
+	
+	--Iterate through File List to process every file.
+	repeat with f in fileList
+		set fPath to POSIX path of f
+		my newLineLog("Processing " & fPath) --Makes a log entry for every file that is processed
+		set codecName to my getVideoData(f) --Gets the codec so we can deal with libopenjpeg differently
+		my makeReport(f, codecName) --Generates the report per file
+	end repeat
+	
+	my newLineLog("DONE")
+	
+end main
+
+
+--------------------- HANDLERS ------------------------
+
+--generates QCTools report
+on makeReport(inputFile, codecName)
+	
+	my newLineLog("		Generating Report.........")
+	
+	try
+		
+		set inputPath to POSIX path of inputFile
+		
+		--We need to dela with J2k/MXF a little differently. This takes care of that
+		if codecName is "libopenjpeg" then
+			set inputCodec to " -vcodec libopenjpeg "
+			set filterString to " -vf tinterlace=mode=merge,setfield=bff "
+		else
+			set inputCodec to " "
+			set filterString to " "
+		end if
+		
+		--creates temprary .nut files containig raw video. Analyzes nut file and outputs data to a .xml.gz file. Deletes nut file when finished to clean up extra files.
+		set ffmpegString to "/usr/local/bin/ffmpeg" & inputCodec & "-vsync 0 -i '" & inputPath & "' -vcodec rawvideo -acodec pcm_s24le" & filterString & "-f nut -y '" & inputPath & ".temp1.nut' && /usr/local/bin/ffprobe -loglevel error -f lavfi 'movie=" & inputPath & ".temp1.nut:s=v+a[in0][in1],[in0]signalstats=stat=tout+vrep+brng,cropdetect=reset=1,split[a][b];[a]field=top[a1];[b]field=bottom[b1],[a1][b1]psnr[out0];[in1]ebur128=metadata=1[out1]' -show_frames -show_versions -of xml=x=1:q=1 -noprivate | gzip > '" & inputPath & ".qctools.xml.gz' && rm '" & inputPath & ".temp1.nut'"
+		
+		do shell script ffmpegString
+		
+		my currLineLog("Done!")
+		
+	on error errMsg
+		
+		my currLineLog("ERROR: " & errMsg)
+		
+	end try
+	
+end makeReport
+
+
+
+--gets video codec using ffprobe
+on getVideoData(inputFile)
+	
+	my newLineLog("		Getting Codec.............")
+	
+	try
+		
+		--Saves ffprobe output to a sidecar file
+		set inputPath to POSIX path of inputFile
+		set ffPath to inputPath & ".ffdata"
+		do shell script "/usr/local/bin/ffprobe -show_streams -of flat -sexagesimal -i " & quoted form of inputPath & " > " & quoted form of ffPath
+		
+		--intelligently figures out which stream is the video stream, so it can be probed for codec info
+		set whichStreamVid to do shell script "cat " & quoted form of ffPath & " | grep '.codec_type=\"video\"'"
+		set whichStreamVid to my getTextItem(".", 3, whichStreamVid)
+		
+		--probes video stream for codec info
+		set codecName to do shell script "cat " & quoted form of ffPath & " | grep 'streams.stream." & whichStreamVid & ".codec_name='"
+		set codecName to replaceText("streams.stream." & whichStreamVid & ".codec_name=", "", codecName)
+		set codecName to replaceText("\"", "", codecName)
+		
+		--deletes sidecar file to minimze leftover files
+		do shell script "rm " & quoted form of ffPath
+		
+		my currLineLog(codecName)
+		
+		return codecName
+		
+	on error errMsg
+		
+		my currLineLog("ERROR: " & errMsg)
+		
+		return ""
+		
+	end try
+	
+end getVideoData
+
+
+--takes an arbitrary inpt alias, determines if it's a file or directory. If file it returns a list with a single item. If it's a directory it asks for a list of extensions, then returns a list with every file in the input matching the extension
+on getFileList(theInput)
+	
+	set fileList to {}
+	set inputPosix to POSIX path of theInput
+	
+	--is it a file or a directory?
+	set inputType to do shell script "file -b " & quoted form of (inputPosix)
+	set inputType to my getTextItem(" ", "last", inputType)
+	
+	if inputType is "directory" then
+		--If it's a directory, allow the user to find files with any extension, since video can take moany forms
+		
+		--Initialize the log the input folder level	
+		my initializeLog(theInput)
+		
+		set isDirectory to true
+		set inputExtension to text returned of (display dialog "Please input the extension of the files you wish to analyze, separete by semi-colons" default answer ".mov;.dv;.mxf")
+		
+		set prevTIDs to AppleScript's text item delimiters
+		set AppleScript's text item delimiters to ";"
+		
+		set extensionList to text items in inputExtension
+		
+		set AppleScript's text item delimiters to prevTIDs
+		
+		set findString to "/usr/bin/find"
+		
+		set findString to findString & " " & quoted form of inputPosix
+		
+		set counter to 1
+		set len to length of extensionList
+		repeat with e in extensionList
+			if counter is equal to len then
+				set findString to findString & " -name '*" & e & "'"
+			else
+				set findString to findString & " -name '*" & e & "' -o "
+			end if
+			set counter to counter + 1
+		end repeat
+		
+		my showLog()
+		my newLineLog("Searching for files with the following extensions: " & my replaceText(";", ", ", extensionList))
+		
+		
+		set findString to findString
+		set findResults to (do shell script findString)
+		
+		set inputFilePaths to {}
+		
+		--this portion separates out the find results into individual srp files
+		set astid to AppleScript's text item delimiters
+		set AppleScript's text item delimiters to "
+"
+		set the inputFilePaths to text items of findResults
+		set AppleScript's text item delimiters to astid
+		
+		repeat with j in inputFilePaths
+			if length of j is not 0 then --a little trick to omit empty spaces that find sometimes returns
+				set theNewAlias to POSIX file j as alias
+				tell application "Finder"
+					set newAliasName to name of theNewAlias
+				end tell
+				if text item 1 of newAliasName is not "." then --excludes annoying hidden files
+					set end of fileList to theNewAlias
+				end if
+			end if
+		end repeat
+		
+	else
+		--if the dropped item is just a file:
+		set isDirectory to false
+		set end of fileList to theInput
+		
+		--Initialize the log at the container level of the input file	
+		tell application "Finder"
+			set parentAlias to parent of theInput as alias
+		end tell
+		
+		my initializeLog(parentAlias)
+		my showLog()
+	end if
+	
+	
+	return fileList
+	
+end getFileList
+
+on getTextItem(delimiter, theItem, inputText)
+	
+	set prevTIDs to AppleScript's text item delimiters
+	set AppleScript's text item delimiters to delimiter
+	
+	if theItem = "last" then
+		set theItem to (number of text items in inputText)
+	else if theItem = "first" then
+		set theItem to 1
+	end if
+	set output to text item theItem of inputText
+	set AppleScript's text item delimiters to prevTIDs
+	return output
+end getTextItem
+
+
+on replaceText(findText, replaceT, someText)
+	--	set someText to someText as text --coerce to text in case it isn't already
+	set prevTIDs to text item delimiters of AppleScript
+	set text item delimiters of AppleScript to findText
+	set someText to text items of someText
+	set text item delimiters of AppleScript to replaceT
+	set someText to "" & someText
+	set text item delimiters of AppleScript to prevTIDs
+	return someText
+end replaceText
+
+on labelColor(aliasList, colorCode)
+	(*
+Labels Map
+
+0 - Clear
+1 - Orange
+2 - Red
+3 - Yellow
+4 - Blue
+5 - Purple
+6 - Green
+7 - Gray
+*)
+	tell application "Finder"
+		set theItems to aliasList as list
+		set theColor to colorCode as number
+		set colorErr to ""
+		
+		
+		repeat with i from 1 to number of items in theItems
+			repeat 20 times
+				set thisItem to item i of theItems as alias
+				try
+					set the label index of thisItem to theColor
+				on error colorErr
+				end try
+				if label index of thisItem = theColor then exit repeat
+				delay 1
+			end repeat
+			if label index of thisItem is not equal to theColor then error ("Can't set the label color of " & thisItem & ": " & colorErr) as text
+		end repeat
+	end tell
+	return
+end labelColor
+
+
+-------logging handlers---------
+on initializeLog(theInput)
+	
+	set theLogPosix to (POSIX path of theInput) & "_QCToolsReports.log"
+	do shell script ("touch " & quoted form of theLogPosix)
+	do shell script ("echo \"\" >> " & quoted form of theLogPosix)
+	set theLog to POSIX file theLogPosix as alias
+	my newLineLog("QCTools Report Generator started")
+	
+end initializeLog
+
+on getDateStamp()
+	set theDate to do shell script "date \"+%y%m%d %H:%M:%S\""
+	return theDate
+end getDateStamp
+
+on showLog()
+	tell application "Console"
+		open theLog --so user can see what is going on
+		activate
+	end tell
+end showLog
+
+on newLineLog(msg) --adds a new line with msg text to the log
+	do shell script ("printf \"" & "
+" & my getDateStamp() & " " & msg & "\" >> " & quoted form of theLogPosix)
+end newLineLog
+
+on currLineLog(msg) --appends msg text to the end of the current line in the log
+	do shell script ("printf \"" & msg & "\" >> " & quoted form of theLogPosix)
+end currLineLog
+
+
